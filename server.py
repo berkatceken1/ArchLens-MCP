@@ -239,6 +239,191 @@ async def analyze_celery_jobs(target_directory: str) -> dict[str, Any]:
     return await asyncio.to_thread(_analyze_celery_jobs_sync, target_directory)
 
 
+def _escape_markdown_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+
+    cell_text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if not cell_text:
+        return "-"
+
+    return cell_text.replace("|", r"\|")
+
+
+def _build_database_schema_section(schema_info: dict[str, Any]) -> list[str]:
+    lines = ["## Database Schema", ""]
+    schema_error = schema_info.get("error")
+    table_rows = schema_info.get("tables", [])
+
+    if schema_error:
+        lines.append(f"Schema analysis warning: `{_escape_markdown_cell(schema_error)}`")
+        lines.append("")
+
+    if not table_rows:
+        lines.append("No table metadata was found.")
+        lines.append("")
+        return lines
+
+    lines.extend(
+        [
+            "| Schema | Table | Column | Data Type | Spatial |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+
+    sorted_rows = sorted(
+        table_rows,
+        key=lambda row: (
+            str(row.get("table_schema", "")),
+            str(row.get("table_name", "")),
+            str(row.get("column_name", "")),
+        ),
+    )
+
+    for row in sorted_rows:
+        spatial_indicator = "No"
+        if row.get("is_spatial"):
+            spatial_type = row.get("spatial_type") or row.get("udt_name") or "unknown"
+            spatial_indicator = f"**POSTGIS ({_escape_markdown_cell(spatial_type)})**"
+
+        lines.append(
+            "| "
+            f"{_escape_markdown_cell(row.get('table_schema'))} | "
+            f"{_escape_markdown_cell(row.get('table_name'))} | "
+            f"{_escape_markdown_cell(row.get('column_name'))} | "
+            f"{_escape_markdown_cell(row.get('data_type') or row.get('udt_name'))} | "
+            f"{spatial_indicator} |"
+        )
+
+    lines.append("")
+    return lines
+
+
+def _build_celery_jobs_section(celery_info: dict[str, Any]) -> list[str]:
+    lines = ["## Background Jobs (Celery)", ""]
+    celery_error = celery_info.get("error")
+    tasks = celery_info.get("tasks", [])
+    skipped_files = celery_info.get("skipped_files", [])
+
+    if celery_error:
+        lines.append(f"Celery analysis warning: `{_escape_markdown_cell(celery_error)}`")
+        lines.append("")
+
+    if not tasks:
+        lines.append("No Celery tasks were detected in the target directory.")
+    else:
+        lines.extend(
+            [
+                "| Task Function | File Path | Docstring |",
+                "| --- | --- | --- |",
+            ]
+        )
+
+        sorted_tasks = sorted(
+            tasks,
+            key=lambda task: (
+                str(task.get("file_path", "")),
+                str(task.get("function_name", "")),
+            ),
+        )
+
+        for task in sorted_tasks:
+            lines.append(
+                "| "
+                f"{_escape_markdown_cell(task.get('function_name'))} | "
+                f"{_escape_markdown_cell(task.get('file_path'))} | "
+                f"{_escape_markdown_cell(task.get('docstring') or 'No docstring provided.')} |"
+            )
+
+    if skipped_files:
+        lines.append("")
+        lines.append(
+            f"Skipped files during Celery scan: {_escape_markdown_cell(len(skipped_files))}."
+        )
+
+    lines.append("")
+    return lines
+
+
+def _build_agents_markdown(
+    target_directory: str,
+    schema_info: dict[str, Any],
+    celery_info: dict[str, Any],
+) -> str:
+    lines: list[str] = [
+        "# AGENTS.md",
+        "",
+        "## Project Architecture Context",
+        (
+            "This document gives AI agents an actionable snapshot of the current project "
+            "architecture, including the database schema and asynchronous job topology."
+        ),
+        (
+            "Use this context to reason about data flow, table relationships, and background "
+            "execution behavior before proposing code changes."
+        ),
+        "",
+        f"Target directory: `{_escape_markdown_cell(target_directory)}`",
+        "",
+    ]
+
+    lines.extend(_build_database_schema_section(schema_info))
+    lines.extend(_build_celery_jobs_section(celery_info))
+    return "\n".join(lines).strip() + "\n"
+
+
+@mcp.tool()
+async def generate_agents_md(target_directory: str) -> dict[str, Any]:
+    """Generate AGENTS.md by combining schema metadata and Celery task analysis."""
+    target_path = Path(target_directory).expanduser().resolve()
+    output_file = target_path / "AGENTS.md"
+
+    if not target_path.exists():
+        return {
+            "success": False,
+            "file_path": str(output_file),
+            "message": f"Target directory does not exist: {target_path}",
+        }
+
+    if not target_path.is_dir():
+        return {
+            "success": False,
+            "file_path": str(output_file),
+            "message": f"Target path is not a directory: {target_path}",
+        }
+
+    try:
+        schema_info, celery_info = await asyncio.gather(
+            get_schema_info(),
+            analyze_celery_jobs(str(target_path)),
+        )
+    except Exception as exc:
+        logger.exception("Failed to collect architecture data.")
+        return {
+            "success": False,
+            "file_path": str(output_file),
+            "message": f"Failed to collect architecture data: {exc}",
+        }
+
+    markdown_content = _build_agents_markdown(str(target_path), schema_info, celery_info)
+
+    try:
+        output_file.write_text(markdown_content, encoding="utf-8")
+    except OSError as exc:
+        logger.exception("Failed to write AGENTS.md to %s", output_file)
+        return {
+            "success": False,
+            "file_path": str(output_file),
+            "message": f"Failed to write AGENTS.md: {exc}",
+        }
+
+    return {
+        "success": True,
+        "file_path": str(output_file),
+        "message": "AGENTS.md was generated successfully.",
+    }
+
+
 if __name__ == "__main__":
     logger.info("Starting ArchLens-MCP...")
     mcp.run(transport="stdio")
