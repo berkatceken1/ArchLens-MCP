@@ -1,3 +1,5 @@
+import ast
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -121,6 +123,120 @@ async def get_schema_info() -> dict[str, Any]:
         return {"error": f"Schema query failed: {exc}", "tables": []}
     finally:
         await conn.close()
+
+
+def _is_celery_task_decorator(decorator: ast.AST) -> bool:
+    """Return True when decorator matches @app.task or @shared_task."""
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+
+    if isinstance(target, ast.Attribute):
+        return (
+            target.attr == "task"
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "app"
+        )
+
+    if isinstance(target, ast.Name):
+        return target.id == "shared_task"
+
+    return False
+
+
+def _analyze_celery_jobs_sync(target_directory: str) -> dict[str, Any]:
+    target_path = Path(target_directory).expanduser().resolve()
+
+    if not target_path.exists():
+        return {
+            "error": f"Target directory does not exist: {target_path}",
+            "target_directory": str(target_path),
+            "tasks": [],
+            "skipped_files": [],
+        }
+
+    if not target_path.is_dir():
+        return {
+            "error": f"Target path is not a directory: {target_path}",
+            "target_directory": str(target_path),
+            "tasks": [],
+            "skipped_files": [],
+        }
+
+    tasks: list[dict[str, Any]] = []
+    skipped_files: list[dict[str, str]] = []
+
+    def _on_walk_error(error: OSError) -> None:
+        skipped_files.append(
+            {
+                "file_path": str(error.filename) if error.filename else "",
+                "reason": f"walk_error: {error}",
+            }
+        )
+        logger.warning("Directory walk error for %s: %s", error.filename, error)
+
+    for root, _, files in os.walk(target_path, onerror=_on_walk_error):
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+
+            file_path = Path(root) / filename
+
+            try:
+                source = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    source = file_path.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeDecodeError) as exc:
+                    skipped_files.append(
+                        {"file_path": str(file_path), "reason": f"read_error: {exc}"}
+                    )
+                    logger.warning("Skipping file %s due to read error: %s", file_path, exc)
+                    continue
+            except OSError as exc:
+                skipped_files.append(
+                    {"file_path": str(file_path), "reason": f"read_error: {exc}"}
+                )
+                logger.warning("Skipping file %s due to read error: %s", file_path, exc)
+                continue
+
+            try:
+                tree = ast.parse(source, filename=str(file_path))
+            except SyntaxError as exc:
+                skipped_files.append(
+                    {
+                        "file_path": str(file_path),
+                        "reason": f"syntax_error: line {exc.lineno}: {exc.msg}",
+                    }
+                )
+                logger.warning("Skipping file %s due to syntax error: %s", file_path, exc)
+                continue
+
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+
+                if not any(_is_celery_task_decorator(d) for d in node.decorator_list):
+                    continue
+
+                tasks.append(
+                    {
+                        "file_path": str(file_path.resolve()),
+                        "function_name": node.name,
+                        "docstring": ast.get_docstring(node),
+                    }
+                )
+
+    return {
+        "target_directory": str(target_path),
+        "tasks": tasks,
+        "task_count": len(tasks),
+        "skipped_files": skipped_files,
+    }
+
+
+@mcp.tool()
+async def analyze_celery_jobs(target_directory: str) -> dict[str, Any]:
+    """Analyze Python files in a directory and list Celery tasks defined with @app.task or @shared_task."""
+    return await asyncio.to_thread(_analyze_celery_jobs_sync, target_directory)
 
 
 if __name__ == "__main__":
